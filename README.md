@@ -1,14 +1,20 @@
 # sccp-eth
 
-SORA Cross-Chain Protocol (SCCP) contracts for EVM chains (Ethereum).
+SORA Cross-Chain Protocol (SCCP) contracts for EVM chains (ETH).
 
-This repo provides:
-- `SccpRouter`: burn wrapped ERC-20s to create an on-chain SCCP burn message + `messageId`
-- `SccpToken`: minimal ERC-20 used as the wrapped representation of a SORA asset
-- `ISccpVerifier`: pluggable on-chain verifier interface (light client / consensus proofs)
+See `contracts/` for:
+- `SccpRouter`: burns wrapped tokens, mints from SORA-finalized burn proofs, and applies token lifecycle updates (`add`, `pause`, `resume`) only from SORA-finalized governance proofs.
+- `SccpToken`: minimal ERC-20 wrapper token for a SORA asset.
+- `ISccpVerifier`: pluggable verifier interface for finalized burn/governance messages.
+- `SoraBeefyLightClientVerifier`: BEEFY+MMR light client used to verify SORA commitments.
 
-`mintFromProof` is **fail-closed** until a real verifier contract is configured.
-Router hardening is also fail-closed for unsupported domains: burn/mint/incident-control calls reject unknown domain IDs.
+The design is roleless on this chain:
+- no local governor/operator controls,
+- immutable verifier on router construction,
+- token add/pause/resume only via proven SORA governance messages.
+
+Runtime/tooling:
+- Node.js 22 (`.nvmrc`, `package.json#engines`)
 
 ## Build
 
@@ -16,70 +22,83 @@ Router hardening is also fail-closed for unsupported domains: burn/mint/incident
 ./scripts/compile.sh
 ```
 
+## Test
+
+```bash
+npm test
+npm run test:formal-assisted
+npm run test:formal-assisted:ci
+npm run test:fuzz
+npm run test:fuzz:nightly
+npm run test:ci-fuzz
+npm run test:ci-all
+npm run test:deploy-scripts
+npm run test:ci-formal
+npm run check:repo-hygiene
+./scripts/check_repo_hygiene.sh
+./scripts/test_formal_assisted.sh
+./scripts/test_fuzz_nightly.sh
+./scripts/test_ci_formal.sh
+./scripts/test_ci_fuzz.sh
+./scripts/test_ci_all.sh
+```
+
 ## Deploy (high level)
 
-1. Deploy `SccpRouter` with:
+1. Deploy `SoraBeefyLightClientVerifier` with constructor bootstrap data from SORA:
+   - `latestBeefyBlock`
+   - `currentValidatorSet = { id, len, root }`
+   - `nextValidatorSet = { id, len, root }`
+2. Deploy `SccpRouter(localDomain, verifier)` with:
    - `localDomain = 1` (ETH)
-   - `governor = <your on-chain governance address>`
-2. For each SORA `asset_id` you want to bridge, deploy/register a wrapped ERC-20:
-   - call `SccpRouter.deployToken(soraAssetId, name, symbol, decimals)`
-3. On SORA (runtime pallet `sccp`):
-   - call `set_domain_endpoint(SCCP_DOMAIN_ETH, <router address bytes>)`
-   - call `set_remote_token(asset_id, SCCP_DOMAIN_ETH, <token address bytes>)`
-   - after setting all required domains, call `activate_token(asset_id)`
-
-## Burn (ETH -> X)
-
-1. `approve(router, amount)` on the wrapped token
-2. `SccpRouter.burnToDomain(soraAssetId, amount, destDomain, recipient32)`
-
-The burn emits `SccpBurned(messageId, ..., payload)` where `payload` is SCALE-encoded
-`BurnPayloadV1` (97 bytes). Target chains compute:
-
-`messageId = keccak256(b"sccp:burn:v1" || payload)`.
+   - `verifier = <SoraBeefyLightClientVerifier>`
+3. Point SORA SCCP domain endpoint to the new router.
+4. Add bridgeable assets by submitting SORA-finalized `TokenAddPayloadV1` proofs to `addTokenFromProof`.
 
 ## Mint (Any -> ETH, Via SORA Finality)
 
-Minting on this chain is always driven by **SORA finality**:
+Minting on this chain is driven by finalized SORA commitments:
+- `SccpRouter.mintFromProof(sourceDomain, payload, soraBeefyMmrProof)`
+- router verifies payload/message binding and proof finality via `ISccpVerifier.verifyBurnProof`.
 
-- For `SORA -> ETH`, SORA burns and commits `messageId` into its auxiliary digest, and users call:
-  - `SccpRouter.mintFromProof(DOMAIN_SORA, payload, soraBeefyMmrProof)`
-- For `X -> ETH` where `X != SORA`, SORA must first verify the source-chain burn and commit its `messageId` into the
-  auxiliary digest (SORA runtime extrinsic `sccp.attest_burn`). Then users call:
-  - `SccpRouter.mintFromProof(sourceDomain = X, payload, soraBeefyMmrProof)`
+## Token Lifecycle (Proof-Driven)
+
+All lifecycle controls are proof-driven and replay-protected:
+- `addTokenFromProof(payload, proof)`
+- `pauseTokenFromProof(payload, proof)`
+- `resumeTokenFromProof(payload, proof)`
+
+Each action uses a distinct message type/prefix and verifier method.
+
+Encode governance payload bytes and message id off-chain:
+
+```bash
+npm run encode-governance-payload -- \
+  --action add \
+  --target-domain 1 \
+  --nonce 1 \
+  --sora-asset-id 0x<assetId32> \
+  --decimals 18 \
+  --name "SCCP Wrapped" \
+  --symbol "wSORA"
+```
 
 ## Verifier Security Properties (SORA -> ETH)
 
 `SoraBeefyLightClientVerifier` enforces:
-
-- `>= 2/3` validator signatures for each imported BEEFY commitment
-- validator merkle-membership proofs against the stored validator set root
-- duplicate signer-key rejection in one commitment proof
-- ECDSA signature validity checks (`r != 0`, `s != 0`, and low-`s`)
-
-## Proofs To SORA (ETH As Source Chain)
-
-Inbound proofs from ETH to SORA are finalized on SORA by domain-specific finality mode:
-
-- default mode: `EthBeaconLightClient` for `DOMAIN_ETH` (currently not integrated on SORA, fail-closed)
-- required runtime controls on SORA:
-  - `sccp.set_inbound_finality_mode(DOMAIN_ETH, EvmAnchor)` (temporary override)
-  - `sccp.set_evm_anchor_mode_enabled(DOMAIN_ETH, true)`
-  - `sccp.set_evm_inbound_anchor(DOMAIN_ETH, block_number, block_hash, state_root)`
-- alternative temporary override: `AttesterQuorum` (CCTP-style threshold ECDSA signatures over `messageId`)
-- long-term target mode remains `EthBeaconLightClient` (trustless beacon finality)
-
-So today, ETH -> SORA minting/attestation is secured by governance-provided finalized execution roots plus on-chain MPT proof verification.
+- `>= 2/3` validator signatures per imported BEEFY commitment,
+- validator merkle-membership proofs against set root,
+- duplicate signer-key rejection,
+- ECDSA validity checks (`r != 0`, `s != 0`, low-`s`),
+- proof fail-closed behavior for malformed payload/proof bytes.
 
 ## Proof Generation (bridge-relayer)
 
-Use `bridge-relayer` to build on-chain proof inputs:
+Use `bridge-relayer` to build verifier inputs:
 
-1. Export verifier init sets:
-   - `sccp evm init`
-2. Import finalized SORA MMR roots:
-   - `sccp evm import-root --justification-block <beefy_block>`
-3. Build mint proof payload for `verifyBurnProof` / `mintFromProof`:
-   - `sccp evm mint-proof --burn-block <burn_block> --beefy-block <beefy_block> --message-id 0x... --abi`
+1. Export verifier init sets.
+2. Import finalized SORA MMR roots.
+3. Build ABI payload/proof bytes for burn or governance message types.
 
-`--abi` returns the exact ABI bytes expected by `SoraBeefyLightClientVerifier.verifyBurnProof`.
+The on-chain verifier consumes proof bytes shaped as:
+- `abi.encode(uint64 leafIndex, uint64 leafCount, bytes32[] items, MmrLeaf leaf, bytes digestScale)`
